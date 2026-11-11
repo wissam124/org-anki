@@ -1002,6 +1002,7 @@ syntax."
 ;;;###autoload
 (defun org-anki-import-deck (name &optional buffer)
   "Import deck with NAME to current buffer, or to BUFFER when provided.
+Enable Org mode in the destination buffer if needed.
 
 This is a best-effort command which doesn't support all of Anki's
 features. Its use case is to import a deck to an .org which from
@@ -1021,6 +1022,8 @@ Pandoc is required to be installed."
         (org-anki--body "notesInfo" `(("notes" . ,ids)))
         (lambda (the-result)
           (save-excursion-to destination
+            (unless (derived-mode-p 'org-mode)
+              (org-mode))
             (insert (format "\n#+%s: %s\n\n" org-anki-prop-deck name))
             (mapc
              (lambda (json)

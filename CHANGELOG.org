@@ -1,4 +1,5 @@
 * Unreleased
+- Enable Org mode in the import destination before inserting notes.
 - Discover fields dynamically from AnkiConnect for import and synchronization.
 - Import every note with its ID as heading and all fields as child headings,
   preserving field order, empty fields, tags, and note type.
