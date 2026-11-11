@@ -6,6 +6,41 @@ Works via [[https://foosoft.net/projects/anki-connect/][AnkiConnect]] add-on to 
 Features deck import via =org-anki-import-deck= (requires pandoc for
 converting html to org).
 
+Import and synchronization discover note fields directly from AnkiConnect.
+There is no need to configure =org-anki-model-fields=, including for custom
+note types. That variable is retained for compatibility with existing
+Emacs configurations, but is no longer used to select fields.
+
+** Imported note structure
+=org-anki-import-deck= always uses the note ID as the top-level heading
+and creates one child heading per field, in Anki's field order. Empty
+fields are included. For example:
+
+#+begin_example
+#+ANKI_DECK: My Deck
+
+* 1502298033753 :study:
+:PROPERTIES:
+:ANKI_NOTE_ID: 1502298033753
+:ANKI_NOTE_TYPE: Basic
+:END:
+** Front
+Question text
+** Back
+Answer text
+#+end_example
+
+The properties retain the note's identity and type for subsequent
+synchronization. Edit the contents under each field heading, then use
+=org-anki-sync-entry= on the note heading or =org-anki-update-all= for
+the buffer. =org-anki-sync-all= also recognizes field headings and skips
+their subtrees as separate notes. Field content containing Org headings
+is nested below its field heading.
+
+Synchronization queries Anki for model fields once per note type per
+operation, so later operations pick up changes to the model in Anki.
+Anki must be running with AnkiConnect enabled.
+
 ** How
 Creates "Basic" or "Cloze" type notes.
 
@@ -93,6 +128,16 @@ card front and content as card back.
 
 The other three are emacs or org-mode only[fn:others], so no spaced repetition
 from your phone or web.
+** Tests
+With =dash=, =promise=, and =request= available on Emacs's load path:
+
+#+begin_src sh
+emacs --batch -L . -l test/org-anki-test.el -f ert-run-tests-batch-and-exit
+#+end_src
+
+The tests mock AnkiConnect and do not modify an Anki collection. The
+Pandoc conversion test is skipped when Pandoc is unavailable.
+
 ** Footnotes
 
 [fn:via] AnkiConnect starts a HTTP server on localhost:8765 which the

@@ -36,6 +36,7 @@
 (require 'json)
 (require 'org)
 (require 'org-element)
+(require 'ox-html)
 (require 'promise)
 (require 'request)
 (require 'thunk)
@@ -76,9 +77,8 @@ See help for `org-map-entries` for how it's used."
     ("Basic (optional reversed card)" "Front" "Back")
     ("NameDescr" "Name" "Descr")
     ("Cloze" "Text" "Extra"))
-  "Default fields for note types.
-
-Each one is a list, the first item is the model name and the rest are field names."
+  "Legacy field definitions, retained for configuration compatibility.
+Import and synchronization discover fields directly from AnkiConnect."
   :type '(repeat (list (repeat string)))
   :group 'org-anki)
 
@@ -754,25 +754,50 @@ be removed from the Anki app, return actions that do that."
             "org-anki-delete-all error: %s"
             the-error))))))
 
+(defvar org-anki--model-fields-cache nil
+  "Model fields cached during one synchronization operation.")
+
 (defun org-anki--get-model-fields (model)
-  ;; :: String -> [FieldName]
-  (let ((fields (cdr (assoc model org-anki-model-fields))))
-    (unless fields
-      (error "No fields for '%s', please customize `org-anki-model-fields'."
-             model))
-    fields))
+  "Get MODEL's ordered field names from AnkiConnect."
+  (or (cdr (assoc model org-anki--model-fields-cache))
+      (let (fields failure)
+        (org-anki-connect-request
+         (org-anki--body "modelFieldNames" `(("modelName" . ,model)))
+         (lambda (result) (setq fields (append result nil)))
+         (lambda (reason) (setq failure reason))
+         :sync t)
+        (unless fields
+          (error "Cannot retrieve fields for '%s': %s"
+                 model (or failure "AnkiConnect returned no fields")))
+        (push (cons model fields) org-anki--model-fields-cache)
+        fields)))
+
+(defun org-anki--field-entry-p ()
+  "Whether this entry is a named field of its parent note."
+  (and (not (org-entry-get nil org-anki-prop-note-id))
+       (let ((title (org-entry-get nil "ITEM")))
+         (save-excursion
+           (and (org-up-heading-safe)
+                (member title
+                        (org-anki--get-model-fields
+                         (org-anki--find-prop
+                          org-anki-note-type org-anki-default-note-type))))))))
 
 (defun org-anki--note-complete (note)
   ;; :: Note -> Bool
-  "Test if all fields of a NOTE have values (i.e, are not nil)"
-  (equal nil (rassq "" (org-anki--note-fields note))))
+  "Whether NOTE has fields with string values, including empty strings."
+  (and note
+       (org-anki--note-fields note)
+       (cl-every (lambda (field) (stringp (cdr field)))
+                 (org-anki--note-fields note))))
 
 ;; Public API
 
 ;;; Convenience functions
 
 (defun org-anki-add-model (model &rest field-names)
-  "Add MODEL with FIELD-NAMES."
+  "Add MODEL with FIELD-NAMES to the legacy configuration.
+Import and synchronization now discover fields from AnkiConnect."
   (customize-set-variable
    'org-anki-model-fields
    (cons `(,model ,@field-names) org-anki-model-fields)))
@@ -784,7 +809,8 @@ be removed from the Anki app, return actions that do that."
   ;; :: IO ()
   "Synchronize entry at point."
   (interactive)
-  (org-anki--sync-notes (cons (org-anki--note-at-point) nil)))
+  (let ((org-anki--model-fields-cache nil))
+    (org-anki--sync-notes (cons (org-anki--note-at-point) nil))))
 
 ;;;###autoload
 (defun org-anki-sync-all (&optional buffer)
@@ -792,11 +818,18 @@ be removed from the Anki app, return actions that do that."
   "Syncronize all entries in optional BUFFER."
   (interactive)
   (with-current-buffer (or buffer (buffer-name))
-    (org-anki--sync-notes
-     (-filter
-      'org-anki--note-complete
-      (org-map-entries
-       'org-anki--note-at-point (org-anki--get-match) nil org-anki-skip-function)))))
+    (let ((org-anki--model-fields-cache nil))
+      (org-anki--sync-notes
+       (-filter #'org-anki--note-complete
+                (org-map-entries
+                 (lambda ()
+                   (if (org-anki--field-entry-p)
+                       (progn
+                         (setq org-map-continue-from
+                               (save-excursion (org-end-of-subtree t) (point)))
+                         nil)
+                     (org-anki--note-at-point)))
+                 (org-anki--get-match) nil org-anki-skip-function))))))
 
 ;;;###autoload
 (defun org-anki-update-all (&optional buffer)
@@ -804,8 +837,9 @@ be removed from the Anki app, return actions that do that."
   "Updates all entries having ANKI_NOTE_ID property in BUFFER."
   (interactive)
   (with-current-buffer (or buffer (buffer-name))
-    (org-anki--sync-notes
-     (org-map-entries 'org-anki--note-at-point "ANKI_NOTE_ID<>\"\""))))
+    (let ((org-anki--model-fields-cache nil))
+      (org-anki--sync-notes
+       (org-map-entries 'org-anki--note-at-point "ANKI_NOTE_ID<>\"\"")))))
 
 ;;;###autoload
 (defun org-anki-update-dir (&optional prefix dir)
@@ -882,28 +916,22 @@ syntax."
 
 ;; Import
 
-(defun org-anki--get-json-field-value (key fields)
-  (let ((maybe-value (assoc key fields)))
-    (org-anki--debug "MAYBE-VALUE %s" maybe-value)
-    (cdr (assoc 'value (cdr maybe-value)))))
-
-;;; Convert JSON to (("FieldName" . "FieldValue") ..)
-(defun org-anki--json-to-fields (fields-json model-fields)
-  (--map
-   (let ((value-html
-          (format
-           "%s"
-           (org-anki--get-json-field-value (intern it) fields-json))))
-    (cons it (funcall org-anki-html-to-org value-html)))
-   model-fields))
+(defun org-anki--json-to-fields (fields-json)
+  "Convert FIELDS-JSON to Org fields in Anki's field order."
+  (mapcar
+   (lambda (field)
+     (cons (if (symbolp (car field)) (symbol-name (car field)) (car field))
+           (funcall org-anki-html-to-org (alist-get 'value (cdr field)))))
+   (sort (copy-sequence fields-json)
+         (lambda (a b)
+           (< (alist-get 'order (cdr a)) (alist-get 'order (cdr b)))))))
 
 (defun org-anki--parse-note (note-json deck-name)
   (cl-flet ((field (lambda (symbol &optional assoc-list)
                      (cdr (assoc symbol (or assoc-list note-json))))))
     (let*
         ((model-name (field 'modelName))
-         (model-fields (org-anki--get-model-fields model-name))
-         (fields (org-anki--json-to-fields (field 'fields) model-fields)))
+         (fields (org-anki--json-to-fields (field 'fields))))
       (make-org-anki--note
        :maybe-id (field 'noteId)
        :fields   fields
@@ -945,30 +973,31 @@ syntax."
   (insert "\n") ; Newline is required to add properties to org entry
   ;; Add ANKI_NOTE_ID
   (org-entry-put nil org-anki-prop-note-id (number-to-string (org-anki--note-maybe-id note)))
-  ;; Add ANKI_NOTE_TYPE if not "Basic":
-  (let ((type (org-anki--note-type note)))
-    (if (not (equal type "Basic"))
-        (org-entry-put nil org-anki-note-type type))))
-
-(defun org-anki--multiline-front (fields)
-  (string-search "\n" (cdr (car fields))))
+  (org-entry-put nil org-anki-note-type (org-anki--note-type note)))
 
 (defun org-anki--write-note (note)
-  (let ((fields (org-anki--note-fields note)))
-    (if (org-anki--multiline-front fields)
-        ;; Note with multiline front
-        (progn
-          (insert "* Note")
-          (org-anki--write-note-properties note)
-          (--each fields
-            (-let [(name . value) it]
-              (insert (format "\n** %s\n%s\n" name value)))))
-      ;; Note with single line front
-      (-let [((_ . front) (_ . back)) fields]
-        (insert (format "* %s" front))
-        (org-anki--write-note-properties note)
-        (insert back)
-        (insert "\n")))))
+  "Insert NOTE with its ID as heading and every field as a child."
+  (insert (format "* %s" (org-anki--note-maybe-id note)))
+  (org-anki--write-note-properties note)
+  ;; Property insertion can move point; append fields after the drawer.
+  (org-end-of-subtree t t)
+  (dolist (field (org-anki--note-fields note))
+    (insert (format "\n** %s\n%s\n" (car field)
+                    (org-anki--nest-field-content (cdr field))))))
+
+(defun org-anki--nest-field-content (content)
+  "Place headings in CONTENT below a level-two field heading."
+  (with-temp-buffer
+    (insert content)
+    (org-mode)
+    ;; Use the Org parser so stars inside source blocks remain untouched.
+    (let ((positions (org-element-map (org-element-parse-buffer) 'headline
+                       (lambda (headline)
+                         (org-element-property :begin headline)))))
+      (dolist (position (reverse positions))
+        (goto-char position)
+        (insert "**")))
+    (buffer-string)))
 
 ;;;###autoload
 (defun org-anki-import-deck (name &optional buffer)
@@ -981,7 +1010,8 @@ then on will be used as source-of-truth for the notes.
 Pandoc is required to be installed."
 
   (interactive "sDeck name: ")
-  (with-current-buffer (or buffer (buffer-name))
+  (let ((destination (with-current-buffer (or buffer (current-buffer))
+                       (point-marker))))
     (org-anki-connect-request
      (org-anki--body
       "findNotes"
@@ -990,11 +1020,12 @@ Pandoc is required to be installed."
        (org-anki-connect-request
         (org-anki--body "notesInfo" `(("notes" . ,ids)))
         (lambda (the-result)
-          (insert (format "\n#+%s: %s\n\n" org-anki-prop-deck name))
-          (mapc
-           (lambda (json)
-             (org-anki--write-note (org-anki--parse-note json name)))
-           the-result))
+          (save-excursion-to destination
+            (insert (format "\n#+%s: %s\n\n" org-anki-prop-deck name))
+            (mapc
+             (lambda (json)
+               (org-anki--write-note (org-anki--parse-note json name)))
+             the-result)))
         (lambda (the-error)
           (org-anki--report-error "Get deck error, received: %s" the-error))))
      (lambda (the-error)

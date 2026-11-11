@@ -1,3 +1,9 @@
+* Unreleased
+- Discover fields dynamically from AnkiConnect for import and synchronization.
+- Import every note with its ID as heading and all fields as child headings,
+  preserving field order, empty fields, tags, and note type.
+- Skip field subtrees as separate notes during bulk synchronization.
+- Keep asynchronous deck imports in the requested destination buffer.
 * v4.0.1
 - make deck import work for non-herestring supporting shell: customize
   the variable =org-anki-html-to-org= to =org-anki--html-to-org-via-tempfile=
